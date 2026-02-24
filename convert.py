@@ -9,6 +9,12 @@ vivo-live-photo-converter
 依赖 / Dependencies (一次性安装 / one-time setup):
     brew install ffmpeg exiftool
     pip install makelive
+
+两阶段处理 / Two-phase processing:
+    阶段一（并行）：FFmpeg 将 MP4 转码为 H.264 MOV        — CPU 密集，线程安全
+    Phase 1 (parallel):  FFmpeg transcodes MP4 → H.264 MOV   — CPU-bound, thread-safe
+    阶段二（串行）：makelive 注入 ContentIdentifier           — AVFoundation 非线程安全
+    Phase 2 (serial):    makelive injects ContentIdentifier   — AVFoundation not thread-safe
 """
 
 import json
@@ -20,15 +26,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# 并行线程数：CPU 核数的一半，最多 4 个
-# Workers: half of CPU cores, max 4
-MAX_WORKERS = max(1, min((os.cpu_count() or 2) // 2, 4))
+# 转码并行数：CPU 核数的一半，最多 4 个 / Transcode workers: half of CPU cores, max 4
+TRANSCODE_WORKERS = max(1, min((os.cpu_count() or 2) // 2, 4))
 
 _print_lock = threading.Lock()
 
 
 def log(text: str):
-    """线程安全打印 / Thread-safe print."""
     with _print_lock:
         print(text)
 
@@ -106,11 +110,11 @@ def get_capture_datetime(jpg: Path) -> str:
     return datetime.fromtimestamp(os.path.getmtime(jpg)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-# ─────────────────────────────── 视频转码 / Video transcode ──────────────────
+# ─────────────────────────────── 阶段一：转码 / Phase 1: Transcode ───────────
 
 def transcode_to_h264_mov(src: Path, dst: Path) -> bool:
     """
-    MP4 (HEVC) → H.264 MOV
+    MP4 (HEVC) → H.264 MOV（线程安全 / thread-safe）
     Photos.app 仅支持 H.264 作为实况照片视频组件
     Photos.app requires H.264 for Live Photo video components.
     """
@@ -131,12 +135,33 @@ def transcode_to_h264_mov(src: Path, dst: Path) -> bool:
     return r.returncode == 0
 
 
-# ─────────────────────────────── 元数据注入 / Metadata injection ──────────────
+def prepare_pair(jpg: Path, mp4: Path, output_dir: Path):
+    """
+    阶段一：复制 JPEG + 转码视频（并行执行）
+    Phase 1: copy JPEG + transcode video (runs in parallel)
+    Returns (out_jpg, out_mov, capture_dt, stem) on success, None on failure.
+    """
+    stem = jpg.stem
+    capture_dt = get_capture_datetime(jpg)
+    out_jpg = output_dir / f"Live_{stem}.jpg"
+    out_mov = output_dir / f"Live_{stem}.mov"
+
+    shutil.copy2(jpg, out_jpg)
+
+    if not transcode_to_h264_mov(mp4, out_mov):
+        log(f"  {stem}\n    [失败 / FAIL] 视频转码 / video transcode\n")
+        return None
+
+    log(f"  {stem}  →  转码完成 / transcoded")
+    return (out_jpg, out_mov, capture_dt, stem)
+
+
+# ─────────────────────────────── 阶段二：注入 / Phase 2: Inject ──────────────
 
 def write_live_photo_metadata(jpg: Path, mov: Path) -> str | None:
     """
-    通过 macOS CoreGraphics + AVFoundation 写入 ContentIdentifier。
-    Use macOS native APIs to write ContentIdentifier to Apple MakerNote + QuickTime Keys.
+    通过 macOS CoreGraphics + AVFoundation 写入 ContentIdentifier（串行执行）
+    Use macOS native APIs — must run serially, AVFoundation is not thread-safe here.
     """
     from makelive import make_live_photo
     try:
@@ -154,33 +179,18 @@ def set_mov_creation_date(mov: Path, creation_date: str) -> bool:
     return r.returncode == 0
 
 
-# ─────────────────────────────── 单对处理 / Process one pair ─────────────────
-
-def process_pair(jpg: Path, mp4: Path, output_dir: Path) -> bool:
-    stem = jpg.stem
-    capture_dt = get_capture_datetime(jpg)
-    out_jpg = output_dir / f"Live_{stem}.jpg"
-    out_mov = output_dir / f"Live_{stem}.mov"
-
-    lines = [f"  {stem}", f"    时间 / Time : {capture_dt}"]
-
-    shutil.copy2(jpg, out_jpg)
-
-    if not transcode_to_h264_mov(mp4, out_mov):
-        lines.append("    [失败 / FAIL] 视频转码 / video transcode")
-        log('\n'.join(lines) + '\n')
-        return False
-
+def finalize_pair(out_jpg: Path, out_mov: Path, capture_dt: str, stem: str) -> bool:
+    """
+    阶段二：注入 ContentIdentifier（串行执行，避免 AVFoundation 并发问题）
+    Phase 2: inject ContentIdentifier (serial — avoids AVFoundation concurrency issues)
+    """
     asset_id = write_live_photo_metadata(out_jpg, out_mov)
     if not asset_id:
-        lines.append("    [失败 / FAIL] 元数据注入 / metadata injection")
-        log('\n'.join(lines) + '\n')
+        log(f"  {stem}\n    [失败 / FAIL] 元数据注入 / metadata injection\n")
         return False
 
-    lines.append(f"    UUID : {asset_id}")
     set_mov_creation_date(out_mov, capture_dt)
-    lines.append(f"    [完成 / OK] → Live_{stem}.{{jpg,mov}}")
-    log('\n'.join(lines) + '\n')
+    log(f"  {stem}\n    UUID : {asset_id}\n    [完成 / OK] → Live_{stem}.{{jpg,mov}}\n")
     return True
 
 
@@ -222,25 +232,36 @@ def main():
     print(f"找到 {len(pairs)} 对实况照片，{len(unpaired)} 个单独文件")
     print(f"Found {len(pairs)} Live Photo pair(s), {len(unpaired)} unpaired file(s)")
     print(f"输出目录 / Output → {output_dir}")
-    print(f"并行线程 / Workers : {MAX_WORKERS}\n")
+    print(f"转码线程 / Transcode workers : {TRANSCODE_WORKERS}\n")
 
-    # ── 并行处理实况照片对 / Process Live Photo pairs in parallel ──
+    # ── 阶段一（并行）：转码 / Phase 1 (parallel): transcode ──────────────────
+    print("阶段一 / Phase 1: 转码 / Transcoding...\n")
+    prepared = []
+    with ThreadPoolExecutor(max_workers=TRANSCODE_WORKERS) as executor:
+        futures = {
+            executor.submit(prepare_pair, jpg, mp4, output_dir): jpg.stem
+            for jpg, mp4 in pairs
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                prepared.append(result)
+
+    # ── 阶段二（串行）：注入元数据 / Phase 2 (serial): inject metadata ─────────
+    print(f"\n阶段二 / Phase 2: 注入元数据 / Injecting metadata ({len(prepared)} 个 / files)...\n")
     ok = 0
-    if pairs:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(process_pair, jpg, mp4, output_dir): jpg.stem
-                for jpg, mp4 in pairs
-            }
-            for future in as_completed(futures):
-                if future.result():
-                    ok += 1
+    for item in sorted(prepared, key=lambda x: x[3]):  # sort by stem for tidy output
+        out_jpg, out_mov, capture_dt, stem = item
+        if finalize_pair(out_jpg, out_mov, capture_dt, stem):
+            ok += 1
 
-    # ── 复制单独文件 / Copy unpaired files ──
+    # ── 复制单独文件 / Copy unpaired files ──────────────────────────────────
     copy_unpaired(unpaired, output_dir)
 
     print("─" * 50)
     print(f"完成 / Done: {ok}/{len(pairs)} 对转换成功 / pair(s) converted")
+    if len(pairs) - ok > 0:
+        print(f"  ⚠ {len(pairs) - ok} 对失败 / pair(s) failed")
     if unpaired:
         print(f"  + {len(unpaired)} 个单独文件已复制 / unpaired file(s) copied")
 
