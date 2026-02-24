@@ -1,81 +1,93 @@
 #!/usr/bin/env python3
 """
-vivophoto_to_iphone: Convert Vivo Motion Photos to Apple Live Photos
+vivo-live-photo-converter
+将 Vivo 动态照片转换为 Apple 实况照片 | Convert Vivo Motion Photos to Apple Live Photos
 
-Usage:
-    python3 convert.py <input_directory>
+用法 / Usage:
+    python3 convert.py <照片文件夹 / photo_directory>
 
-Dependencies (one-time setup):
+依赖 / Dependencies (一次性安装 / one-time setup):
     brew install ffmpeg exiftool
     pip install makelive
-
-What this does:
-    For each JPG+MP4 pair with the same filename:
-    1. Copies the JPG (preserving all original EXIF metadata)
-    2. Transcodes MP4 → H.264 MOV (required codec for Live Photo pairing)
-    3. Uses macOS CoreGraphics + AVFoundation (via makelive) to write
-       ContentIdentifier into Apple MakerNote (JPEG) and QuickTime Keys (MOV)
-    4. Aligns the MOV creation timestamp with the JPG's EXIF capture time
-    5. Outputs: LivePhoto_Export/Live_<name>.jpg + Live_<name>.mov
-
-Import to Mac Photos:
-    Open Photos → File → Import → select LivePhoto_Export folder
-    Select ALL files at once before clicking Import.
 """
 
 import json
+import os
 import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+# 并行线程数：CPU 核数的一半，最多 4 个
+# Workers: half of CPU cores, max 4
+MAX_WORKERS = max(1, min((os.cpu_count() or 2) // 2, 4))
 
-# ─────────────────────────────── Dependency check ────────────────────────────
+_print_lock = threading.Lock()
+
+
+def log(text: str):
+    """线程安全打印 / Thread-safe print."""
+    with _print_lock:
+        print(text)
+
+
+# ─────────────────────────────── 依赖检查 / Dependency check ─────────────────
 
 def check_dependencies():
-    missing_brew = []
-    for tool in ("ffmpeg", "exiftool"):
-        r = subprocess.run(["which", tool], capture_output=True)
-        if r.returncode != 0:
-            missing_brew.append(tool)
-    if missing_brew:
-        print("Missing dependencies. Run:")
-        print(f"  brew install {' '.join(missing_brew)}")
+    missing = [t for t in ("ffmpeg", "exiftool")
+               if subprocess.run(["which", t], capture_output=True).returncode != 0]
+    if missing:
+        print(f"缺少工具 / Missing tools: {' '.join(missing)}")
+        print(f"  brew install {' '.join(missing)}")
         sys.exit(1)
-
     try:
         import makelive  # noqa: F401
     except ImportError:
-        print("Missing Python dependency. Run:")
+        print("缺少 Python 包 / Missing Python package: makelive")
         print("  pip install makelive")
         sys.exit(1)
 
 
-# ─────────────────────────────── File scanning ───────────────────────────────
+# ─────────────────────────────── 扫描目录 / Scan directory ───────────────────
 
-def find_pairs(input_dir: Path) -> list[tuple[Path, Path]]:
-    """Return sorted list of (jpg, mp4) pairs sharing the same stem."""
+def scan_directory(input_dir: Path):
+    """
+    返回 / Returns:
+      pairs    — 同名 JPG+MP4 文件对 / (jpg, mp4) pairs with matching stems
+      unpaired — 无对应文件的单独 JPG 或 MP4 / lone JPG or MP4 files
+    """
     jpg_map: dict[str, Path] = {}
+    mp4_map: dict[str, Path] = {}
+
     for f in input_dir.iterdir():
         if f.suffix.lower() == ".jpg":
             jpg_map[f.stem] = f
+        elif f.suffix.lower() == ".mp4":
+            mp4_map[f.stem] = f
 
-    pairs = []
-    for f in input_dir.iterdir():
-        if f.suffix.lower() == ".mp4" and f.stem in jpg_map:
-            pairs.append((jpg_map[f.stem], f))
+    paired_stems: set[str] = set()
+    pairs: list[tuple[Path, Path]] = []
+    for stem, jpg in jpg_map.items():
+        if stem in mp4_map:
+            pairs.append((jpg, mp4_map[stem]))
+            paired_stems.add(stem)
 
-    return sorted(pairs, key=lambda p: p[0].stem)
+    unpaired: list[Path] = (
+        [f for stem, f in jpg_map.items() if stem not in paired_stems] +
+        [f for stem, f in mp4_map.items() if stem not in paired_stems]
+    )
+
+    return (
+        sorted(pairs, key=lambda p: p[0].stem),
+        sorted(unpaired, key=lambda f: f.name),
+    )
 
 
-# ─────────────────────────────── EXIF reading ────────────────────────────────
+# ─────────────────────────────── 读取 EXIF / Read EXIF ───────────────────────
 
 def get_capture_datetime(jpg: Path) -> str:
-    """
-    Read DateTimeOriginal + OffsetTimeOriginal from JPEG EXIF.
-    Returns an ISO-8601 string like '2026-02-21T18:19:55+08:00'.
-    Falls back to file mtime if EXIF is absent.
-    """
     r = subprocess.run(
         ["exiftool", "-j", "-DateTimeOriginal", "-OffsetTimeOriginal", str(jpg)],
         capture_output=True, text=True,
@@ -83,39 +95,31 @@ def get_capture_datetime(jpg: Path) -> str:
     if r.returncode == 0:
         try:
             data = json.loads(r.stdout)[0]
-            dt_raw = data.get("DateTimeOriginal", "")   # "2026:02:21 18:19:55"
-            tz = data.get("OffsetTimeOriginal", "")     # "+08:00" or ""
-
+            dt_raw = data.get("DateTimeOriginal", "")
+            tz = data.get("OffsetTimeOriginal", "")
             if dt_raw:
                 dt_iso = dt_raw.replace(":", "-", 2).replace(" ", "T")
                 return dt_iso + tz if tz else dt_iso
         except (json.JSONDecodeError, IndexError, KeyError):
             pass
-
-    import os
     from datetime import datetime
-    mtime = os.path.getmtime(jpg)
-    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S")
+    return datetime.fromtimestamp(os.path.getmtime(jpg)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-# ─────────────────────────────── Video processing ────────────────────────────
+# ─────────────────────────────── 视频转码 / Video transcode ──────────────────
 
 def transcode_to_h264_mov(src: Path, dst: Path) -> bool:
     """
-    Transcode source video to H.264 MOV.
-    Must re-encode (not stream copy) because Vivo records HEVC, and
+    MP4 (HEVC) → H.264 MOV
+    Photos.app 仅支持 H.264 作为实况照片视频组件
     Photos.app requires H.264 for Live Photo video components.
     """
     r = subprocess.run(
         [
             "ffmpeg", "-i", str(src),
-            "-c:v", "libx264",
-            "-crf", "18",
-            "-preset", "fast",
-            "-profile:v", "high",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "128k",
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             "-y", "-loglevel", "error",
             str(dst),
@@ -123,85 +127,76 @@ def transcode_to_h264_mov(src: Path, dst: Path) -> bool:
         capture_output=True,
     )
     if r.returncode != 0:
-        print(f"    [FFmpeg error] {r.stderr.decode(errors='replace')[:300]}")
+        log(f"    [FFmpeg 错误 / error] {r.stderr.decode(errors='replace')[:300]}")
     return r.returncode == 0
 
 
-# ─────────────────────────────── Metadata injection ──────────────────────────
+# ─────────────────────────────── 元数据注入 / Metadata injection ──────────────
 
 def write_live_photo_metadata(jpg: Path, mov: Path) -> str | None:
     """
-    Write ContentIdentifier to both JPEG and MOV using macOS native APIs:
-      - JPEG: CoreGraphics writes to Apple MakerNote (kCGImagePropertyMakerAppleDictionary["17"])
-              This is what Photos.app actually reads for Live Photo pairing.
-      - MOV:  AVFoundation writes to QuickTime Keys atom
-              (com.apple.quicktime.content.identifier)
-
-    Returns the asset UUID on success, None on failure.
-    ExifTool cannot do this for non-Apple JPEGs; makelive uses the correct native APIs.
+    通过 macOS CoreGraphics + AVFoundation 写入 ContentIdentifier。
+    Use macOS native APIs to write ContentIdentifier to Apple MakerNote + QuickTime Keys.
     """
     from makelive import make_live_photo
     try:
-        asset_id = make_live_photo(str(jpg), str(mov))
-        return asset_id
+        return make_live_photo(str(jpg), str(mov))
     except Exception as e:
-        print(f"    [makelive error] {e}")
+        log(f"    [makelive 错误 / error] {e}")
         return None
 
 
 def set_mov_creation_date(mov: Path, creation_date: str) -> bool:
-    """Write creation date to MOV QuickTime Keys (applied after makelive export)."""
     r = subprocess.run(
-        [
-            "exiftool",
-            f"-Keys:CreationDate={creation_date}",
-            "-overwrite_original",
-            str(mov),
-        ],
+        ["exiftool", f"-Keys:CreationDate={creation_date}", "-overwrite_original", str(mov)],
         capture_output=True, text=True,
     )
-    if r.returncode != 0:
-        print(f"    [ExifTool date error] {r.stderr.strip()[:200]}")
     return r.returncode == 0
 
 
-# ─────────────────────────────── Per-pair pipeline ───────────────────────────
+# ─────────────────────────────── 单对处理 / Process one pair ─────────────────
 
 def process_pair(jpg: Path, mp4: Path, output_dir: Path) -> bool:
     stem = jpg.stem
     capture_dt = get_capture_datetime(jpg)
-
     out_jpg = output_dir / f"Live_{stem}.jpg"
     out_mov = output_dir / f"Live_{stem}.mov"
 
-    print(f"  {stem}")
-    print(f"    Time : {capture_dt}")
+    lines = [f"  {stem}", f"    时间 / Time : {capture_dt}"]
 
-    # Step 1: Copy JPEG (preserves all original EXIF: GPS, lens, etc.)
     shutil.copy2(jpg, out_jpg)
 
-    # Step 2: Transcode MP4 → H.264 MOV
     if not transcode_to_h264_mov(mp4, out_mov):
-        print("    [FAIL] video transcode")
+        lines.append("    [失败 / FAIL] 视频转码 / video transcode")
+        log('\n'.join(lines) + '\n')
         return False
 
-    # Step 3: Write ContentIdentifier via macOS CoreGraphics + AVFoundation
-    #         (only method that creates proper Apple MakerNote in non-Apple JPEG)
     asset_id = write_live_photo_metadata(out_jpg, out_mov)
     if not asset_id:
-        print("    [FAIL] ContentIdentifier injection")
+        lines.append("    [失败 / FAIL] 元数据注入 / metadata injection")
+        log('\n'.join(lines) + '\n')
         return False
 
-    print(f"    UUID : {asset_id}")
-
-    # Step 4: Align MOV creation date with JPEG capture time
+    lines.append(f"    UUID : {asset_id}")
     set_mov_creation_date(out_mov, capture_dt)
-
-    print(f"    [OK]  → Live_{stem}.{{jpg,mov}}")
+    lines.append(f"    [完成 / OK] → Live_{stem}.{{jpg,mov}}")
+    log('\n'.join(lines) + '\n')
     return True
 
 
-# ─────────────────────────────── Entry point ─────────────────────────────────
+# ─────────────────────────────── 复制单独文件 / Copy unpaired files ──────────
+
+def copy_unpaired(files: list[Path], output_dir: Path):
+    if not files:
+        return
+    log(f"复制单独文件 / Copying unpaired files ({len(files)})...")
+    for f in files:
+        shutil.copy2(f, output_dir / f.name)
+        log(f"  {f.name}  →  已复制 / copied")
+    log("")
+
+
+# ─────────────────────────────── 入口 / Entry point ──────────────────────────
 
 def main():
     if len(sys.argv) < 2:
@@ -212,36 +207,50 @@ def main():
 
     input_dir = Path(sys.argv[1]).resolve()
     if not input_dir.is_dir():
-        print(f"Error: not a directory: {input_dir}")
+        print(f"错误 / Error: 不是目录 / not a directory: {input_dir}")
         sys.exit(1)
 
     output_dir = input_dir / "LivePhoto_Export"
     output_dir.mkdir(exist_ok=True)
 
-    pairs = find_pairs(input_dir)
-    if not pairs:
-        print("No JPG+MP4 pairs found.")
+    pairs, unpaired = scan_directory(input_dir)
+
+    if not pairs and not unpaired:
+        print("未找到照片 / No photos found.")
         sys.exit(0)
 
-    print(f"Found {len(pairs)} pair(s)")
-    print(f"Output → {output_dir}\n")
+    print(f"找到 {len(pairs)} 对实况照片，{len(unpaired)} 个单独文件")
+    print(f"Found {len(pairs)} Live Photo pair(s), {len(unpaired)} unpaired file(s)")
+    print(f"输出目录 / Output → {output_dir}")
+    print(f"并行线程 / Workers : {MAX_WORKERS}\n")
 
+    # ── 并行处理实况照片对 / Process Live Photo pairs in parallel ──
     ok = 0
-    for jpg, mp4 in pairs:
-        if process_pair(jpg, mp4, output_dir):
-            ok += 1
-        print()
+    if pairs:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(process_pair, jpg, mp4, output_dir): jpg.stem
+                for jpg, mp4 in pairs
+            }
+            for future in as_completed(futures):
+                if future.result():
+                    ok += 1
 
-    print(f"{'─'*50}")
-    print(f"Done: {ok}/{len(pairs)} converted.")
+    # ── 复制单独文件 / Copy unpaired files ──
+    copy_unpaired(unpaired, output_dir)
 
-    if ok > 0:
-        print(f"\nNext steps:")
-        print(f"  1. Open Mac Photos.app")
-        print(f"  2. File → Import")
-        print(f"  3. Select the LivePhoto_Export folder")
-        print(f"  4. Select ALL files (⌘A) then click Import")
-        print(f"     (both files must be imported together for pairing)")
+    print("─" * 50)
+    print(f"完成 / Done: {ok}/{len(pairs)} 对转换成功 / pair(s) converted")
+    if unpaired:
+        print(f"  + {len(unpaired)} 个单独文件已复制 / unpaired file(s) copied")
+
+    if ok + len(unpaired) > 0:
+        print("""
+下一步 / Next steps:
+  1. 打开照片 App / Open Photos.app
+  2. 文件 → 导入 / File → Import
+  3. 选择 LivePhoto_Export 文件夹 / Select LivePhoto_Export folder
+  4. ⌘A 全选后点导入 / Select all (⌘A) then Import""")
 
 
 if __name__ == "__main__":
